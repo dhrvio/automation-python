@@ -1,147 +1,147 @@
-import re
 import os
+import re
 import random
 import subprocess
 from pathlib import Path
+from dotenv import load_dotenv
 from youtubesearchpython import VideosSearch
-from moviepy.video.io.VideoFileClip import VideoFileClip
-from moviepy.video.VideoClip import TextClip
-from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+from instagrapi import Client
 
-# === Config ===
-NUM_VIDEOS = 3
-REELS_PER_VIDEO = 2
-REEL_DURATION = 10  # seconds
+# === Load environment from .env ===
+load_dotenv()
+
+# === Config from Environment ===
+SEARCH_TERM  = os.environ.get("YT_SEARCH_TERM")
+NUM_SHORTS   = int(os.environ.get("YT_SHORTS_COUNT", 10))
+MIN_VIEWS    = int(os.environ.get("YT_MIN_VIEWS", 10000))    # threshold for "nice" views
+MAX_AGE_DAYS = int(os.environ.get("YT_MAX_AGE_DAYS", 700))    # only recent uploads
+IG_USERNAME  = os.environ.get("IG_USERNAME")
+IG_PASSWORD  = os.environ.get("IG_PASSWORD")
+
+# Create output directory
 VIDEO_DIR = Path("videos")
 VIDEO_DIR.mkdir(exist_ok=True)
 
-# === Captions ===
-CAPTIONS = [
-    "This scene is so funny 😂",
-    "This hits different",
-    "I love this actor 😍",
-    "Peak fiction!",
-    "How can anyone not love this!",
-    "Too good 🔥",
-    "ICONIC moment 🤌",
-    "I’ve watched this 10 times",
-]
-
 # === Helpers ===
+
 def sanitize_filename(name: str) -> str:
-    """Remove or replace characters invalid for file names."""
-    return re.sub(r'[<>:"/\\|?*]', '_', name).strip()
+    return "".join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in name).strip()
 
-# === Step 1: Search YouTube ===
-def search_youtube_videos(keyword: str, num_results: int = 1):
-    """Try VideosSearch; fallback to yt-dlp search if it fails."""
-    print(f"🔍 Searching YouTube for: {keyword}")
+
+def parse_views(text: str) -> int:
+    """
+    Convert strings like '1.2M views', '500K views' into an integer.
+    """
+    num_str = text.lower().replace(' views', '').strip()
+    match = re.match(r"([\d\.,]+)([km]?)", num_str)
+    if not match:
+        return 0
+    val, suffix = match.groups()
+    val = float(val.replace(',', ''))
+    if suffix == 'k':
+        val *= 1_000
+    elif suffix == 'm':
+        val *= 1_000_000
+    return int(val)
+
+
+def parse_age_days(published: str) -> int:
+    """
+    Convert strings like '3 hours ago', '2 days ago', '1 week ago', '5 months ago'
+    into a rough day-count. Unknown formats count as old (> MAX_AGE_DAYS).
+    """
+    parts = published.lower().split()
+    if len(parts) < 2:
+        return MAX_AGE_DAYS + 1
+
     try:
-        videos_search = VideosSearch(keyword, limit=num_results)
-        results = videos_search.result().get('result', [])
-        return [(item['title'], item['link']) for item in results]
-    except Exception:
-        # fallback: use yt-dlp search
-        cmd = [
-            "yt-dlp",
-            f"ytsearch{num_results}:{keyword}",
-            "--print", "%(title)s|||%(webpage_url)s",
-            "--skip-download"
-        ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        videos = []
-        for line in proc.stdout.strip().splitlines():
-            if '|||' in line:
-                title, url = line.split('|||', 1)
-                videos.append((title.strip(), url.strip()))
-        return videos
+        n = int(parts[0])
+    except ValueError:
+        return MAX_AGE_DAYS + 1
 
-# === Step 2: Download video using yt-dlp ===
+    unit = parts[1]
+    if 'minute' in unit or 'hour' in unit:
+        return 0
+    if 'day' in unit:
+        return n
+    if 'week' in unit:
+        return n * 7
+    if 'month' in unit:
+        return n * 30
+    if 'year' in unit:
+        return n * 365
+
+    return MAX_AGE_DAYS + 1
+
+
+def search_recent_shorts(keyword: str, limit: int = 10):
+    print(f"🔍 Searching for recent shorts: {keyword}")
+    raw = VideosSearch(f"{keyword} #shorts", limit=limit * 3).result().get('result', [])
+    shorts = []
+
+    for item in raw:
+        title      = item.get('title', 'No title')
+        url        = item.get('link')
+        channel    = item.get('channel', {}).get('name', 'Unknown')
+        views_text = item.get('viewCount', {}).get('text', '0 views')
+        age_text   = item.get('publishedTime', '')
+
+        views = parse_views(views_text)
+        age   = parse_age_days(age_text)
+
+        if views < MIN_VIEWS:
+            print(f"  ✂️ SKIP '{title}' — only {views_text}")
+            continue
+        if age > MAX_AGE_DAYS:
+            print(f"  ✂️ SKIP '{title}' — {age_text} (>{MAX_AGE_DAYS} days)")
+            continue
+
+        print(f"  ✅ KEEP '{title}' — {views_text}, {age_text}")
+        shorts.append((title, url, channel))
+        if len(shorts) >= limit:
+            break
+
+    return shorts
+
+
 def download_video(title: str, url: str) -> Path:
-    safe_title = sanitize_filename(title)
-    filepath = VIDEO_DIR / f"{safe_title}.mp4"
+    safe = sanitize_filename(title)
+    out  = VIDEO_DIR / f"{safe}.mp4"
+    if not out.exists():
+        print(f"📥 Downloading: {title}")
+        subprocess.run(["yt-dlp", url, "-f", "mp4", "-o", str(out)], check=True)
+    else:
+        print(f"📁 Already exists: {out.name}")
+    return out
 
-    if filepath.exists():
-        print(f"📁 Already downloaded: {filepath.name}")
-        return filepath
 
-    print(f"📥 Downloading: {title}")
-    subprocess.run([
-        "yt-dlp", url,
-        "-o", str(filepath)
-    ], check=True)
-    return filepath
+def upload_reel(video_path: Path, caption: str):
+    cl = Client()
+    cl.login(IG_USERNAME, IG_PASSWORD)
+    print(f"🚀 Uploading to Instagram: {video_path.name}")
+    cl.clip_upload(str(video_path), caption)
+    cl.logout()
 
-# === Step 3: Clip a short reel ===
-def clip_video(input_path: Path, start: int, duration: int, output_path: Path) -> Path:
-    print(f"🎬 Clipping: {input_path.name} [{start}s -> {start + duration}s]")
-    with VideoFileClip(str(input_path)) as clip:
-        try:
-            sub = clip.subclip(start, start + duration)
-        except AttributeError:
-            sub = clip.subclipped(start, start + duration)
-        sub.write_videofile(str(output_path), codec="libx264", audio_codec="aac")
-    return output_path
 
-# === Step 4: Add a caption ===
-def add_caption(video_path: Path, caption: str, output_path: Path) -> Path:
-    print(f"📝 Adding caption: '{caption}'")
-    with VideoFileClip(str(video_path)) as video:
-        try:
-            txt_clip = (TextClip(caption, fontsize=50, color='white', 
-                        font='Arial-Unicode-Regular',  # Try this common font
-                        size=(video.size[0]*0.9, None))
-                        .set_position(('center', 'top'))
-                        .set_duration(video.duration))
-            final = CompositeVideoClip([video, txt_clip])
-            final.write_videofile(str(output_path), fps=24)
-        except Exception as e:
-            print(f"⚠️ Could not add caption: {e}")
-            # Fallback - copy the video without caption
-            video.write_videofile(str(output_path), fps=24)
-    return output_path
-
-# === Step 5: Generate Reels from One Video ===
-def create_reels_from_video(video_path: Path, base_title: str):
-    try:
-        with VideoFileClip(str(video_path)) as video:
-            duration = int(video.duration)
-    except Exception as e:
-        print(f"⚠️ Could not load video {video_path.name}: {e}")
-        return []
-
-    reels = []
-    for i in range(REELS_PER_VIDEO):
-        start = random.randint(0, max(0, duration - REEL_DURATION))
-        caption = random.choice(CAPTIONS)
-        reel_file = VIDEO_DIR / f"{base_title}_reel{i+1}.mp4"
-        captioned_file = VIDEO_DIR / f"{base_title}_reel{i+1}_caption.mp4"
-
-        clip_video(video_path, start, REEL_DURATION, reel_file)
-        add_caption(reel_file, caption, captioned_file)
-        reels.append(captioned_file)
-
-    return reels
-
-# === Main ===
 def main():
-    keyword = input("Enter genre or keyword: ")
-    results = search_youtube_videos(keyword, NUM_VIDEOS)
-
-    if not results:
-        print("No results found.")
+    if not (SEARCH_TERM and IG_USERNAME and IG_PASSWORD):
+        print("⚠️ Please set YT_SEARCH_TERM, IG_USERNAME & IG_PASSWORD in your .env or shell.")
         return
 
-    for title, url in results:
-        print(f"\n📥 Processing video: {title}")
-        try:
-            video_path = download_video(title, url)
-            safe_title = sanitize_filename(title)
-            create_reels_from_video(video_path, safe_title)
-        except subprocess.CalledProcessError:
-            print(f"❌ Failed to download {title}")
+    shorts = search_recent_shorts(SEARCH_TERM, NUM_SHORTS)
+    if not shorts:
+        print("❌ No suitable shorts found.")
+        return
 
-    print("\n✅ All reels generated in 'videos/' folder.")
+    for title, url, channel in shorts:
+        try:
+            vid    = download_video(title, url)
+            credit = f"Credit: {channel} - {title}"
+            upload_reel(vid, credit)
+        except Exception as e:
+            print(f"⚠️ Error processing '{title}': {e}")
+
+    print("✅ Done: All reels uploaded.")
 
 if __name__ == "__main__":
     main()
